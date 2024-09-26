@@ -5,7 +5,7 @@ This file contains the Llama2 model whose backbone is the [transformer](https://
 
 ### Attention
 The multi-head attention layer of the transformer. This layer maps a query and a set of key-value pairs to an output. The output is calculated as the weighted sum of the values, where the weight of each value is computed by a function that takes the query and the corresponding key. To implement this layer, you can:
-1. linearly project the queries, keys, and values with their corresponding linear layers
+1. linearly project the[llama.py](llama.py) queries, keys, and values with their corresponding linear layers
 2. split the vectors for multi-head attention
 3. follow the equation to compute the attended output of each head
 4. concatenate multi-head attention outputs to recover the original shape

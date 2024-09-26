@@ -121,6 +121,7 @@ def save_model(model, optimizer, args, config, filepath):
 		'model': model.state_dict(),
 		'optim': optimizer.state_dict(),
 		'args': args,
+		'model_args': args,
 		'model_config': config,
 		'system_rng': random.getstate(),
 		'numpy_rng': np.random.get_state(),
@@ -309,7 +310,7 @@ def get_args():
 	parser.add_argument("--epochs", type=int, default=5)
 	parser.add_argument("--option", type=str,
 						help='prompt: the Llama parameters are frozen; finetune: Llama parameters are updated',
-						choices=('generate', 'prompt', 'finetune'), default="generate")
+						choices=('generate', 'prompt', 'finetune', 'finetune_lora'), default="generate")
 	parser.add_argument("--use_gpu", action='store_true')
 	parser.add_argument("--generated_sentence_low_temp_out", type=str, default="generated-sentence-temp-0.txt")
 	parser.add_argument("--generated_sentence_high_temp_out", type=str, default="generated-sentence-temp-1.txt")
@@ -341,7 +342,7 @@ if __name__ == "__main__":
 		# Step 2
 		# Solve this task with prompted language modeling
 		test_with_prompting(args)
-	elif args.option == "finetune":
+	elif args.option == "finetune" or args.option == "finetune_lora":
 		# Step 3
 		# Finetune a classification model
 		train(args)

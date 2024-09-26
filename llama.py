@@ -1,3 +1,4 @@
+from argparse import Namespace
 from contextlib import nullcontext
 from typing import Optional, Tuple
 import math
@@ -43,8 +44,10 @@ class RMSNorm(torch.nn.Module):
         Returns:
             torch.Tensor: The normalized tensor.
         """
-        # todo
-        raise NotImplementedError
+        # todo done
+        squared = torch.square(x)
+        meaned = torch.mean(squared, dim=-1, keepdim=True)
+        return x/torch.sqrt(meaned + self.eps)
 
     def forward(self, x):
         """
@@ -60,8 +63,28 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
+
+class LoRALayer(nn.Module):
+    def __init__(self, in_features, out_features, rank, name = None):
+        super().__init__()
+        self.rank = rank
+        self.name = name
+        # Freeze the original weights
+        self.weight = nn.Parameter(torch.empty(out_features, in_features), requires_grad=False)
+        nn.init.xavier_uniform_(self.weight)  # Use Xavier initialization for the weight
+
+        # Learnable low-rank matrices
+        self.lora_A = nn.Parameter(torch.empty(rank, in_features))  # Create empty tensor for A
+        nn.init.xavier_uniform_(self.lora_A)  # Initialize A with Xavier
+
+        self.lora_B = nn.Parameter(torch.empty(out_features, rank))  # Create empty tensor for B
+        nn.init.xavier_uniform_(self.lora_B)  # Initialize B with Xavier
+
+    def forward(self, x):
+        return torch.matmul(x, self.weight.T) + torch.matmul(torch.matmul(x, self.lora_A.T), self.lora_B.T)
+
 class Attention(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, rank=32):
         super().__init__()
         self.n_kv_heads = config.n_heads if config.n_kv_heads is None else config.n_kv_heads
         assert config.n_heads % self.n_kv_heads == 0
@@ -71,9 +94,21 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = config.dim // config.n_heads
         self.max_seq_len = config.max_seq_len
+        #
         self.compute_query = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
         self.compute_key = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.compute_value = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+
+        # # Use LoRALayer for queries, keys, and values instead of nn.Linear
+        # self.compute_query = LoRALayer(config.dim, config.n_heads * self.head_dim, rank=rank, name="lora_query")
+        # self.compute_key = LoRALayer(config.dim, self.n_kv_heads * self.head_dim, rank=rank, name="lora_key")
+        # self.compute_value = LoRALayer(config.dim, self.n_kv_heads * self.head_dim, rank=rank, name="lora_value")
+
+        # Adapter layers
+        # self.adapter_down = nn.Linear(config.dim, 16)
+        # self.adapter_up = nn.Linear(16, config.dim)
+        # self.adapter_activation = nn.LeakyReLU()
+
         self.compute_output = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -82,7 +117,7 @@ class Attention(nn.Module):
     def compute_query_key_value_scores(self,
                                        query: torch.Tensor,
                                        key: torch.Tensor,
-                                       value: torch.Tensor) -> torch.Tensor:
+                                       value: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         '''
         Jointly compute Scaled Dot Product Attention (see Section 3.2.1 in
         https://arxiv.org/abs/1706.03762 for details). The query, key, and
@@ -93,8 +128,11 @@ class Attention(nn.Module):
         Make sure to use attention_dropout (self.attn_dropout) on the computed
         attention matrix before applying it to the value tensor.
         '''
-        # todo
-        raise NotImplementedError
+        # todo done
+        transposed_key = key.transpose(-2, -1)
+        product = torch.matmul(query, transposed_key) / (self.head_dim ** 0.5)
+        attention_weights = self.attn_dropout(torch.softmax(product, dim=-1))
+        return torch.matmul(attention_weights, value)
 
     def forward(
         self,
@@ -135,6 +173,12 @@ class Attention(nn.Module):
 
         # restore time as batch dimension and concat heads
         output = output.transpose(1, 2).contiguous().view(batch_size, seqlen, -1)
+
+        # Apply adapter
+        # adapter_output = self.adapter_activation(self.adapter_down(output))
+        # adapter_output = self.adapter_up(adapter_output)
+        #
+        # output = output + adapter_output
 
         # final projection into the residual stream
         output = self.resid_dropout(self.compute_output(output))
@@ -196,8 +240,13 @@ class LlamaLayer(nn.Module):
         5) add a residual connection from the unnormalized self-attention output to the
            output of the feed-forward network
         '''
-        # todo
-        raise NotImplementedError
+        # todo done
+        norm_x = self.attention_norm(x)
+        attention_output = self.attention(norm_x)
+        residual = attention_output + x
+        ff_input = self.ffn_norm(residual)
+        ff_output = self.feed_forward(ff_input)
+        return ff_output + residual
 
 class Llama(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -267,18 +316,18 @@ class Llama(LlamaPreTrainedModel):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         Also note this is a super inefficient version of sampling with no key/value cache.
         """
+        self.eval()
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] # crop to just the final time step
-            # todo
-            raise NotImplementedError
+            # todo done
 
             if temperature == 0.0:
                 # select the single most likely index
-                idx_next = None
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             else:
                 '''
                 Perform temperature sampling:
@@ -289,7 +338,8 @@ class Llama(LlamaPreTrainedModel):
 
                 Note that we are not using top-k sampling/nucleus sampling in this procedure.
                 '''
-                idx_next = None
+                props_scaled = torch.softmax(logits / temperature, dim=-1)
+                idx_next = torch.multinomial(props_scaled, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
@@ -309,7 +359,13 @@ def load_pretrained(checkpoint):
 
   # init from a model saved in a specific directory
   checkpoint_dict = torch.load(checkpoint, map_location=device)
-  config = LlamaConfig(**checkpoint_dict['model_args'])
+  args = checkpoint_dict['model_args']
+  if isinstance(args, Namespace):
+      args = vars(args)  # Convert Namespace to dict
+
+  config = LlamaConfig(**args)
+  # config = LlamaConfig(**checkpoint_dict['args'])
+
   model = Llama(config)
   state_dict = checkpoint_dict['model']
   unwanted_prefix = '_orig_mod.'

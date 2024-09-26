@@ -36,11 +36,18 @@ class LlamaEmbeddingClassifier(torch.nn.Module):
 		self.num_labels = config.num_labels
 		self.llama = load_pretrained(config.pretrained_model_path)
 		# If we use pretrain mode, we freeze Llama parameters.
-		for param in self.llama.parameters():
-			if config.option == 'pretrain':
-				param.requires_grad = False
-			elif config.option == 'finetune':
-				param.requires_grad = True
+		if config.option == 'pretrain' or config.option == 'finetune':
+			for param in self.llama.parameters():
+				if config.option == 'pretrain':
+					param.requires_grad = False
+				elif config.option == 'finetune':
+					param.requires_grad = True
+		elif config.option == 'finetune_lora':
+			for name, param in self.llama.named_parameters():
+				if "lora" in name or "adapter" in name:
+					param.requires_grad = True
+				else:
+					param.requires_grad = False
 
 		self.dropout = torch.nn.Dropout(config.hidden_dropout_prob)
 		self.classifier_head = torch.nn.Linear(self.llama.config.dim, self.num_labels)
@@ -54,5 +61,10 @@ class LlamaEmbeddingClassifier(torch.nn.Module):
 		   logits (unnormalized probabilities) over all classes.
 		3) Take the log-softmax of the logits and return log-probabilities over all classes.
 		'''
-		# todo
-		raise NotImplementedError
+		# todo done
+		_, h = self.llama(input_ids)
+		h = h[:, -1, :]
+		h = self.dropout(h)
+		h = self.classifier_head(h)
+		probs = torch.log_softmax(h, dim=-1)
+		return probs
