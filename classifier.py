@@ -31,10 +31,10 @@ class LlamaZeroShotClassifier(torch.nn.Module):
 		return label_probabilities
 
 class LlamaEmbeddingClassifier(torch.nn.Module):
-	def __init__(self, config):
+	def __init__(self, config, fine_tuning_config):
 		super(LlamaEmbeddingClassifier, self).__init__()
 		self.num_labels = config.num_labels
-		self.llama = load_pretrained(config.pretrained_model_path)
+		self.llama = load_pretrained(config.pretrained_model_path, fine_tuning_config)
 		# If we use pretrain mode, we freeze Llama parameters.
 		if config.option == 'pretrain' or config.option == 'finetune':
 			for param in self.llama.parameters():
@@ -42,7 +42,7 @@ class LlamaEmbeddingClassifier(torch.nn.Module):
 					param.requires_grad = False
 				elif config.option == 'finetune':
 					param.requires_grad = True
-		elif config.option == 'finetune_lora':
+		elif config.option == 'finetune_efficient':
 			for name, param in self.llama.named_parameters():
 				if "lora" in name or "adapter" in name:
 					param.requires_grad = True

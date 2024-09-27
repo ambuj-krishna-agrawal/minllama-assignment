@@ -10,6 +10,7 @@ from base_llama import LlamaPreTrainedModel, LlamaConfig
 from rope import apply_rotary_emb
 from utils import *
 
+
 # Root Mean Square Layer Normalization (https://arxiv.org/abs/1910.07467)
 # borrowed from the official Llama implementation:
 # https://github.com/facebookresearch/llama/blob/main/llama/model.py
@@ -47,7 +48,7 @@ class RMSNorm(torch.nn.Module):
         # todo done
         squared = torch.square(x)
         meaned = torch.mean(squared, dim=-1, keepdim=True)
-        return x/torch.sqrt(meaned + self.eps)
+        return x / torch.sqrt(meaned + self.eps)
 
     def forward(self, x):
         """
@@ -65,7 +66,7 @@ class RMSNorm(torch.nn.Module):
 
 
 class LoRALayer(nn.Module):
-    def __init__(self, in_features, out_features, rank, name = None):
+    def __init__(self, in_features, out_features, rank, name=None):
         super().__init__()
         self.rank = rank
         self.name = name
@@ -83,8 +84,9 @@ class LoRALayer(nn.Module):
     def forward(self, x):
         return torch.matmul(x, self.weight.T) + torch.matmul(torch.matmul(x, self.lora_A.T), self.lora_B.T)
 
+
 class Attention(nn.Module):
-    def __init__(self, config: LlamaConfig, rank=32):
+    def __init__(self, config: LlamaConfig, fine_tuning_config: dict):
         super().__init__()
         self.n_kv_heads = config.n_heads if config.n_kv_heads is None else config.n_kv_heads
         assert config.n_heads % self.n_kv_heads == 0
@@ -94,20 +96,35 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = config.dim // config.n_heads
         self.max_seq_len = config.max_seq_len
-        #
-        self.compute_query = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
-        self.compute_key = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.compute_value = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.fine_tuning_config = fine_tuning_config
+        lora_enabled = False
+        adapter_enabled = False
+        lora_rank = 16
+        adapter_dimension = 8
+        if fine_tuning_config is not None and fine_tuning_config.get("lora_enabled", False):
+            lora_enabled = True
+            lora_rank = fine_tuning_config["lora_rank"]
+        if fine_tuning_config is not None and fine_tuning_config.get("adapter_enabled", False):
+            adapter_enabled = True
+            adapter_dimension = fine_tuning_config["adapter_dimension"]
 
-        # # Use LoRALayer for queries, keys, and values instead of nn.Linear
-        # self.compute_query = LoRALayer(config.dim, config.n_heads * self.head_dim, rank=rank, name="lora_query")
-        # self.compute_key = LoRALayer(config.dim, self.n_kv_heads * self.head_dim, rank=rank, name="lora_key")
-        # self.compute_value = LoRALayer(config.dim, self.n_kv_heads * self.head_dim, rank=rank, name="lora_value")
+        if lora_enabled:
+            # # Use LoRALayer for queries, keys, and values instead of nn.Linear
+            self.compute_query = LoRALayer(config.dim, config.n_heads * self.head_dim, rank=lora_rank,
+                                           name="lora_query")
+            self.compute_key = LoRALayer(config.dim, self.n_kv_heads * self.head_dim, rank=lora_rank, name="lora_key")
+            self.compute_value = LoRALayer(config.dim, self.n_kv_heads * self.head_dim, rank=lora_rank,
+                                           name="lora_value")
+        else:
+            self.compute_query = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
+            self.compute_key = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+            self.compute_value = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
 
-        # Adapter layers
-        # self.adapter_down = nn.Linear(config.dim, 16)
-        # self.adapter_up = nn.Linear(16, config.dim)
-        # self.adapter_activation = nn.LeakyReLU()
+        if adapter_enabled:
+            # Adapter layers
+            self.adapter_down = nn.Linear(config.dim, adapter_dimension)
+            self.adapter_up = nn.Linear(adapter_dimension, config.dim)
+            self.adapter_activation = nn.LeakyReLU()
 
         self.compute_output = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -135,8 +152,8 @@ class Attention(nn.Module):
         return torch.matmul(attention_weights, value)
 
     def forward(
-        self,
-        x: torch.Tensor
+            self,
+            x: torch.Tensor
     ):
         '''
         Llama2 uses Grouped-Query Attention. The details of GQA are actually
@@ -174,11 +191,12 @@ class Attention(nn.Module):
         # restore time as batch dimension and concat heads
         output = output.transpose(1, 2).contiguous().view(batch_size, seqlen, -1)
 
-        # Apply adapter
-        # adapter_output = self.adapter_activation(self.adapter_down(output))
-        # adapter_output = self.adapter_up(adapter_output)
-        #
-        # output = output + adapter_output
+        if self.fine_tuning_config is not None and self.fine_tuning_config.get("adapter_enabled", False):
+            # Apply adapter
+            adapter_output = self.adapter_activation(self.adapter_down(output))
+            adapter_output = self.adapter_up(adapter_output)
+
+            output = output + adapter_output
 
         # final projection into the residual stream
         output = self.resid_dropout(self.compute_output(output))
@@ -209,12 +227,12 @@ class FeedForward(nn.Module):
 
 
 class LlamaLayer(nn.Module):
-    def __init__(self, layer_id: int, config: LlamaConfig):
+    def __init__(self, layer_id: int, config: LlamaConfig, fine_tuning_config):
         super().__init__()
         self.n_heads = config.n_heads
         self.dim = config.dim
         self.head_dim = config.dim // config.n_heads
-        self.attention = Attention(config)
+        self.attention = Attention(config, fine_tuning_config)
         self.feed_forward = FeedForward(
             dim=config.dim,
             hidden_dim=config.hidden_dim,
@@ -248,8 +266,9 @@ class LlamaLayer(nn.Module):
         ff_output = self.feed_forward(ff_input)
         return ff_output + residual
 
+
 class Llama(LlamaPreTrainedModel):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, fine_tuning_config):
         '''
         You will probably never need to call this function, unless you decide
         to pretrain a Llama model from scratch.
@@ -263,12 +282,12 @@ class Llama(LlamaPreTrainedModel):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = torch.nn.ModuleList()
         for layer_id in range(config.n_layers):
-            self.layers.append(LlamaLayer(layer_id, config))
+            self.layers.append(LlamaLayer(layer_id, config, fine_tuning_config))
         self.norm = RMSNorm(config.dim, eps=config.layer_norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
+        self.tok_embeddings.weight = self.output.weight  # https://paperswithcode.com/method/weight-tying
 
         # some useful precompute for the RoPE relative positional embeddings
 
@@ -277,7 +296,7 @@ class Llama(LlamaPreTrainedModel):
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('w3.weight') or pn.endswith('compute_output.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layers))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -301,7 +320,7 @@ class Llama(LlamaPreTrainedModel):
             logits = self.output(h)
         else:
             # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.output(h[:, [-1], :])  # note: using list [-1] to preserve the time dim
 
         return logits, h
 
@@ -322,7 +341,7 @@ class Llama(LlamaPreTrainedModel):
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] # crop to just the final time step
+            logits = logits[:, -1, :]  # crop to just the final time step
             # todo done
 
             if temperature == 0.0:
@@ -343,34 +362,28 @@ class Llama(LlamaPreTrainedModel):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
-
         return idx
 
-def load_pretrained(checkpoint):
-  device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-  #dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-  dtype = "float32"
 
-  torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-  torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-  device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-  ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-  ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+def load_pretrained(checkpoint, fine_tuning_config=None):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
+    #dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+    dtype = "float32"
 
-  # init from a model saved in a specific directory
-  checkpoint_dict = torch.load(checkpoint, map_location=device)
-  args = checkpoint_dict['model_args']
-  if isinstance(args, Namespace):
-      args = vars(args)  # Convert Namespace to dict
+    torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
+    torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+    device_type = 'cuda' if 'cuda' in device else 'cpu'  # for later use in torch.autocast
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-  config = LlamaConfig(**args)
-  # config = LlamaConfig(**checkpoint_dict['args'])
-
-  model = Llama(config)
-  state_dict = checkpoint_dict['model']
-  unwanted_prefix = '_orig_mod.'
-  for k,v in list(state_dict.items()):
-      if k.startswith(unwanted_prefix):
-          state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-  model.load_state_dict(state_dict, strict=False)
-  return model
+    # init from a model saved in a specific directory
+    checkpoint_dict = torch.load(checkpoint, map_location=device)
+    config = LlamaConfig(**checkpoint_dict['model_args'])
+    model = Llama(config, fine_tuning_config)
+    state_dict = checkpoint_dict['model']
+    unwanted_prefix = '_orig_mod.'
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict, strict=False)
+    return model
